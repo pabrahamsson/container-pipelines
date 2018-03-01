@@ -1,5 +1,7 @@
 ---
 openshift_cluster_content:
+- galaxy_requirements:
+  - "{{ inventory_dir }}/../requirements.yml"
 - object: projectrequest
   content:
   - name: basic-python-flask-spaces
@@ -21,6 +23,14 @@ openshift_cluster_content:
     template: https://raw.githubusercontent.com/rht-labs/labs-ci-cd/master/openshift-templates/sonarqube/template.json
     params: "{{ inventory_dir }}/../files/deployments/sonar/params"
   - name: jenkins
+    pre_steps:
+    - role: casl-ansible/roles/openshift-route-status
+      vars:
+        delay: 5
+        protocol: http
+        retries: 60
+        route: sonarqube
+        status: 200
     namespace: basic-python-flask-build
     template: "{{ inventory_dir }}/../files/deployments/jenkins.yml"
     params: "{{ inventory_dir }}/../files/deployments/build/params"
