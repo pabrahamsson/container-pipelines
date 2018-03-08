@@ -1,0 +1,213 @@
+#!groovy
+
+/*
+  This is example pipeline  
+ */
+pipeline {
+  // environment {}
+  options {
+    // set a timeout of 20 minutes for this pipeline
+    timeout(time: 20, unit: 'MINUTES')
+    // when running Jenkinsfile from SCM using jenkinsfilepath the node implicitly does a checkout
+    skipDefaultCheckout()
+  }
+  agent {
+    label 'maven'
+  }
+  parameters {
+    string(name: 'APP_NAME', defaultValue: 'spring-boot-web', description: "Application Name - all resources use this name as a label")
+    string(name: 'BASE_IMAGE', defaultValue: 'openshift/redhat-openjdk18-openshift:1.2', description: "S2I Image to use for build")
+    string(name: 'SANDBOX_PROJECT', defaultValue: 'toni-s1', description: "Name of the Sandbox namespace")
+    string(name: 'ARTIFACT_URL', defaultValue: 'http://something', description: "SpringBoot artifact url (e.g. Nexus)")
+  }
+
+  stages {
+    // Checkout stage, to get Git repo content
+    stage('Checkout') {
+      steps {
+        // Turn off Git's SSL cert check
+        sh 'git config --global http.sslVerify false'
+        // Use Jenkins standard mechanism to check out Git
+        sh 'git clone https://github.com/pabrahamsson/simple-spring-boot-web.git .'
+        sh 'git clone https://github.com/redhat-cop/container-pipelines.git'
+      }
+    }
+
+    // Init stage, to just display some information about build environment and to what OCP cluster are we connected to
+    stage('initialize') {
+      steps {
+        echo "Build Number is: ${env.BUILD_NUMBER}"
+        echo "Job Name is: ${env.JOB_NAME}"
+        sh 'printenv'
+        script {
+          openshift.withCluster() {
+            echo "Using project ${openshift.project()} in cluster with url ${openshift.cluster()}"
+          }
+        }
+      }
+    }
+
+    /*
+    // Create or update the Build + ImageStream configuration on OpenShift
+    stage('Ensure OpenShift Build and ImageStream Exists') {
+      steps {
+        script {
+          applyTemplates('', '${SANDBOX_PROJECT}', 'bolig-example/build.yml', 'bolig-example/toni-test.params')
+        }
+      }
+    }
+
+    // Download the Jar -artifact to Jenkins Workspace
+    stage('Download Artifact') {
+      steps {
+        sh 'curl ${ARTIFACT_URL}  -o app.jar --noproxy nexus.intra.example.com'
+      }
+    }
+    */
+  
+    // Build artifact
+    stage('Build artifact') {
+      steps {
+        sh 'mvn clean install -DskipTests=true -f pom.xml'
+      }
+    }
+  
+    // Unit tests
+    stage('Unit tests') {
+      steps {
+        sh 'mvn test -f pom.xml'
+      }
+    }
+  
+    // Build image
+    stage('Build Image') {
+      steps {
+        sh """
+        rm -rf oc-build && mkdir -p oc-build/deployments
+        cp -rfv ./target/*.jar oc-build/deployments/ 2> /dev/null
+        """
+        script {
+          openshift.withCluster() {
+            openshift.withProject("${APP_NAME}-build") {
+              openshift.selector("bc", "${APP_NAME}").startBuild("--from-dir=oc-build").logs("-f")
+            }
+          }
+        }
+      }
+    }
+  
+    /*
+    // Create or update any Openshift objects
+    stage('Ensure Openshift objects exist (Dev)') {
+      steps {
+        script {
+          applyTemplates('', "${APP_NAME}-dev", 'container-pipelines/blue-green-spring/files/deployment/template.yml', 'container-pipelines/blue-green-spring/files/deployment/dev/params')
+        }
+      }
+    }
+    */
+  
+    // Promote image to Dev
+    stage('Promote to Dev') {
+      steps {
+        script {
+          openshift.withCluster() {
+            openshift.withProject("${APP_NAME}-build") {
+              openshift.tag("${APP_NAME}-build/${APP_NAME}:latest", "${APP_NAME}-dev/${APP_NAME}:latest")
+            }
+          }
+        }
+      }
+    }
+
+    // Rollout latest changes of the DeploymentConfig
+    // This includes taking into use any new image build since last deployment
+    stage('Deploy latest (Dev)') {
+      steps {
+        script {
+          deploy("", "${APP_NAME}-dev", "${APP_NAME}")
+        }
+      }
+    }
+  
+    // Promote to Stage
+    stage('Promote to Stage') {
+      steps {
+        script {
+          openshift.withCluster() {
+            openshift.withProject("${APP_NAME}-build") {
+              openshift.tag("${APP_NAME}-build/${APP_NAME}:latest", "${APP_NAME}-stage/${APP_NAME}:latest")
+            }
+          }
+        }
+      }
+    }
+
+    // Rollout latest changes of the DeploymentConfig
+    // This includes taking into use any new image build since last deployment
+    stage('Deploy latest (Stage)') {
+      steps {
+        script {
+          deploy("", "${APP_NAME}-stage", "${APP_NAME}")
+        }
+      }
+    }
+  }
+}
+
+// Helper function to start the deployment
+// Params
+// cluster - The cluster connection information, if null use default
+// namespace - The OCP Project/Namespace where this deployment happens
+// appname - Name of the DeploymentConfig that we will init deploy on
+def deploy(cluster, namespace, appname) {
+  openshift.withCluster(cluster) {
+    openshift.withProject("${namespace}") {
+      def deployment = openshift.selector("dc", "${appname}")
+      echo "Starting deployment of ${deployment.names()}"
+      deployment.rollout().latest()
+      deployment.rollout().status("-w")
+    }
+  }
+}
+
+// Helper funcion to create or update configuration objects on OCP
+// Uses "oc apply" - logic to do this
+// Because there's a bug in OCP 3.7, there's extra check to see if DeploymentConfig pre-exists before updating it
+// Params
+// cluster - The cluster connection information, if null use default
+// namespace - The OCP Project/Namespace where this deployment happens
+// templateFile - File path to the OCP template file
+// parameterFile - File path to the OCP template parameters file, that contains key-value pairs
+def applyTemplates(cluster, namespace, templateFile, parameterFile) {
+  openshift.withCluster(cluster) {
+    openshift.withProject("${namespace}") {
+      // Load the Template with Paramters file
+      def models = openshift.process("--filename=${templateFile}", "--param-file=${parameterFile}", "--ignore-unknown-parameters")
+      echo "Creating this template will instantiate ${models.size()} objects"
+
+      // We need to find DeploymentConfig definitions inside 
+      // So iterating trough all the objects loaded from the Template
+      for (o in models) {
+        if (o.kind == "DeploymentConfig") {
+          // The bug in OCP 3.7 is that when applying DC the "Image" can't be undefined
+          // But when using automatic triggers it updates the value for this on runtime
+          // So when applying this dynamic value gets overwriten and breaks deployments
+
+          // We will check if this DeploymentConfig already pre-exists and fetch the current value of Image
+          // And set this Image -value into the DeploymentConfig template we are applying
+          def dcSelector = openshift.selector("deploymentconfig/${o.metadata.name}")
+          def foundObjects = dcSelector.exists()
+          if (foundObjects) {
+            echo "This DC exists, matchinf image value"
+            def dcObjs = dcSelector.objects(exportable: true)
+            echo "Image now: ${dcObjs[0].spec.template.spec.containers[0].image}"
+            o.spec.template.spec.containers[0].image = dcObjs[0].spec.template.spec.containers[0].image
+          }
+        }
+      }
+      def created = openshift.apply(models)
+      echo "Created: ${created.names()}"
+    }
+  }
+}
