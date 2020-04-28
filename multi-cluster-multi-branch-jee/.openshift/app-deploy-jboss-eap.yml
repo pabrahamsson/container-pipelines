@@ -38,6 +38,7 @@ objects:
         - image: "${IMAGE_REPO}/${NAMESPACE}/${NAME}:${APP_TAG}"
           imagePullPolicy: Always
           name: "${NAME}"
+          env:
           - name: JAVA_OPTS_APPEND
             value: "${JAVA_OPTS_APPEND}"
           livenessProbe:
