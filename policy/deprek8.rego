@@ -103,3 +103,10 @@ _deny = msg {
   input.kind == kinds[_]
   msg := sprintf("%s/%s: API certmanager.k8s.io/v1alpha1 for %s is obsolete, use acme.cert-manager.io/v1alpha2 instead.", [input.kind, input.metadata.name, input.kind])
 }
+
+_deny = msg {
+  input.apiVersion == "v1"
+  input.kind == "Rolebinding"
+  #input.roleRef.apiGroup == null
+  msg := sprintf("%s/%s: RoleBinding roleRef.apiGroup key is null, use rbac.authorization.k8s.io instead.", [input.kind, input.metadata.name])
+}
